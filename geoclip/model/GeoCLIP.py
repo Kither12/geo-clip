@@ -10,6 +10,9 @@ from .misc import load_gps_data, file_dir
 from PIL import Image
 from torchvision.transforms import ToPILImage
 
+from scenedetect import VideoManager, SceneManager
+from scenedetect.detectors import ContentDetector
+
 class GeoCLIP(nn.Module):
     def __init__(self, from_pretrained=True, queue_size=4096):
         super().__init__()
@@ -90,7 +93,7 @@ class GeoCLIP(nn.Module):
         return logits_per_image
 
     @torch.no_grad()
-    def predict(self, image_path, top_k):
+    def predict_image(self, image_path, top_k):
         """ Given an image, predict the top k GPS coordinates
 
         Args:
@@ -114,5 +117,56 @@ class GeoCLIP(nn.Module):
         top_pred = torch.topk(probs_per_image, top_k, dim=1)
         top_pred_gps = self.gps_gallery[top_pred.indices[0]]
         top_pred_prob = top_pred.values[0]
+
+        return top_pred_gps, top_pred_prob
+
+    @torch.no_grad()
+    def predict_video(self, video_path, top_k):
+        """ Given an video, predict the top k GPS coordinates
+
+        Args:
+            video_path (str): Path to the image
+            top_k (int): Number of top predictions to return
+
+        Returns:
+            top_pred_gps (torch.Tensor): Top k GPS coordinates of shape (k, 2)
+            top_pred_prob (torch.Tensor): Top k GPS probabilities of shape (k,)
+        """
+        frame_tensors = []
+        gps_gallery = self.gps_gallery.to(self.device)
+
+        video_manager = VideoManager([video_path])
+        scene_manager = SceneManager()
+        scene_manager.add_detector(ContentDetector())
+
+        video_manager.start()
+        scene_manager.detect_scenes(frame_source=video_manager)
+        scene_list = scene_manager.get_scene_list()
+
+        for scene in scene_list:
+            start_frame = scene[0].get_frames()  # Start frame of the scene
+            video_manager.set_duration(start_time=scene[0], end_time=scene[0])
+
+            video_manager.seek(start_frame)
+            ret, frame = video_manager.read()
+            if not ret:
+                continue
+            
+            frame_image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            frame_image = self.image_encoder.preprocess_image(frame_image)
+            frame_image = frame_image.to(self.device)
+
+            frame_tensors.append(frame_image)
+
+
+        frame_tensors = torch.stack(frame_tensors)
+        logits_per_image = self.forward(frame_tensors, gps_gallery)
+        probs_per_image = logits_per_image.softmax(dim=-1).cpu()
+
+        probs = torch.sum(probs_per_image, dim=0) 
+
+        for i in range(top_k):
+            gps_tuple = tuple(top_pred_gps[i].tolist())
+            gps_accum[gps_tuple] += top_pred_prob[i].item()
 
         return top_pred_gps, top_pred_prob
